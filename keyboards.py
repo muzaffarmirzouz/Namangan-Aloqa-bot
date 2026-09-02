@@ -91,6 +91,17 @@ def withdrawal_confirm_kb(withdrawal_id: int) -> InlineKeyboardMarkup:
     )
 
 
+def broadcast_confirm_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="✅ Yuborish", callback_data="bc:send"),
+                InlineKeyboardButton(text="❌ Bekor qilish", callback_data="bc:cancel"),
+            ]
+        ]
+    )
+
+
 def video_status_kb(ticket_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
