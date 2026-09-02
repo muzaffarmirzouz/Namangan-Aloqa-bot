@@ -1,5 +1,7 @@
 """Adminlar uchun xabar matnlarini shakllantiruvchi yordamchi funksiyalar."""
 
+import html
+
 STATUS_LABELS = {
     "yangi": "🆕 Yangi",
     "muzokara": "🤝 Muzokarada",
@@ -13,10 +15,16 @@ def fmt_price(n: int) -> str:
 
 
 def build_appeal_header(ticket_id: int, full_name: str, username: str | None, tg_id: int) -> str:
-    uname = f"@{username}" if username else "username yo'q"
+    # Eslatma: bot xabarlari HTML rejimida yuboriladi, foydalanuvchi ismi
+    # yoki username'ida `<`, `>`, `&` kabi belgilar bo'lishi mumkin (Telegram
+    # profil ismiga istalgan belgi qo'yish mumkin) — shuning uchun html.escape
+    # qilmasak, bunday xabar yuborishda "can't parse entities" xatosi chiqib,
+    # ADMIN'GA UMUMAN XABAR YETMAY QOLISHI MUMKIN.
+    safe_name = html.escape(full_name)
+    uname = f"@{html.escape(username)}" if username else "username yo'q"
     return (
         f"🆕 Yangi murojaat #{ticket_id}\n"
-        f"👤 {full_name} ({uname})\n"
+        f"👤 {safe_name} ({uname})\n"
         f"🆔 <code>{tg_id}</code>\n\n"
         f"Javob berish uchun ushbu xabarga (yoki shu foydalanuvchidan kelgan "
         f"istalgan xabarga) reply qiling — javobingiz avtomatik unga yetkaziladi."
@@ -34,7 +42,8 @@ def build_video_header(
     max_price: int,
     price: int | None = None,
 ) -> str:
-    uname = f"@{username}" if username else "username yo'q"
+    safe_name = html.escape(full_name)
+    uname = f"@{html.escape(username)}" if username else "username yo'q"
     status_text = STATUS_LABELS.get(status, status)
     min_fmt = fmt_price(min_price)
     max_fmt = fmt_price(max_price)
@@ -46,7 +55,7 @@ def build_video_header(
 
     return (
         f"🎥 Yangi video taklif #{ticket_id}\n"
-        f"👤 {full_name} ({uname})\n"
+        f"👤 {safe_name} ({uname})\n"
         f"🆔 <code>{tg_id}</code>\n"
         f"📱 <code>{phone}</code>\n"
         f"{price_line}\n"

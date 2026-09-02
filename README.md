@@ -59,6 +59,16 @@ da yozilgan, ma'lumotlar SQLite'da saqlanadi.
      summa sarflangani** va foydalanuvchilarda **hali yechilmagan balans**.
    - `/bought` — sotib olingan videolarning ro'yxati (kim, qachon, necha
      so'mga) — oxirgi 20 tasi.
+6. **📢 Ommaviy xabar yuborish** — `/broadcast` yozib, keyin yubormoqchi
+   bo'lgan xabaringizni (matn, rasm yoki video — nima yuborsangiz o'shanday
+   ketadi) yuborsangiz, bot avval "necha kishiga yuborilsin" deb tasdiq
+   so'raydi, so'ng botni bloklamagan barcha foydalanuvchilarga (shu jumladan
+   import qilingan eski ro'yxatdagilarga) ketma-ket yuboradi. Bu fonda
+   ishlaydi (bot shu paytda ham murojaatlarga javob berishda davom etadi),
+   minglab odam bo'lsa bir necha o'n daqiqa davom etishi mumkin, va tugagach
+   sizga "necha kishiga yetdi / nechtasi bloklagan / nechtasi xato" degan
+   hisobot keladi. Bir vaqtning o'zida faqat bitta ommaviy xabar yuborilishi
+   mumkin.
 
 > ⚠️ **Muhim:** botning sizga yuborgan xabariga (yoki o'sha zanjirdagi
 > istalgan xabarga) **reply** qilingan HAR QANDAY xabaringiz avtomatik
