@@ -12,6 +12,15 @@ da yozilgan, ma'lumotlar SQLite'da saqlanadi.
    yozishmangizga yetkazadi. O'sha xabarga **reply** qilib javob yozsangiz,
    javob avtomatik foydalanuvchiga yetadi (foydalanuvchi botning
    username'ini yoki ID'sini bilishi shart emas, hammasi bot ichida bo'ladi).
+   - Sizga kelgan har bir **rasm/video/hujjat/audio/ovozli xabar** ostida
+     kimdan kelgani (ism, username, ID, agar bo'lsa telefon raqami va
+     ticket raqami) avtomatik yozib qo'yiladi — bir nechta kishi bir vaqtda
+     yozayotganda ham adashib qolmaysiz.
+   - Agar kimdir **video** yuborsa-yu, bizda uning telefon raqami hali
+     bo'lmasa (masalan "Oddiy murojaat" orqali to'g'ridan-to'g'ri video
+     yuborsa), bot videoni qabul qilishdan oldin **avval telefon raqamini
+     so'raydi** — video shu payt yuborilmaydi, raqam ulashilgach qayta
+     yuborish kerak bo'ladi.
 2. **🎥 Video sotaman** — tugma bosilishi bilan bot avval foydalanuvchiga
    qoidalarni eslatadi (video tiniq/sifatli va ma'lumotlar aniq bo'lishi
    shart, to'lov video kanalga chiqqandan keyin amalga oshadi, yolg'on
