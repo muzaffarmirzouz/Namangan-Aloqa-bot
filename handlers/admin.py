@@ -6,10 +6,12 @@ bosgach, murojaat va video-takliflar to'g'ridan-to'g'ri o'sha adminning
 shaxsiy chatiga keladi va admin xuddi shu yerda reply qilib javob beradi.
 """
 
+import asyncio
+import html
 import logging
 
 from aiogram import Bot, F, Router
-from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
 from aiogram.filters import Command, CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -17,7 +19,12 @@ from aiogram.types import CallbackQuery, Message
 
 import database as db
 from config import cfg
-from keyboards import balance_withdraw_kb, video_status_kb, withdrawal_confirm_kb
+from keyboards import (
+    balance_withdraw_kb,
+    broadcast_confirm_kb,
+    video_status_kb,
+    withdrawal_confirm_kb,
+)
 from utils import build_video_header, fmt_price
 
 router = Router(name="admin")
@@ -29,6 +36,13 @@ logger = logging.getLogger(__name__)
 
 class AdminStates(StatesGroup):
     awaiting_price = State()
+    awaiting_broadcast_content = State()
+
+
+# Bir vaqtning o'zida faqat bitta ommaviy xabar yuborilishi uchun (barcha
+# adminlar uchun umumiy, chunki hammasi bir xil foydalanuvchilar ro'yxatiga
+# yuboradi).
+_broadcast_running = False
 
 
 STATUS_ACTION_LABELS = {
@@ -52,7 +66,8 @@ ADMIN_HELP_TEXT = (
     "kelgan istalgan xabarga) <b>reply</b> qiling — javobingiz avtomatik "
     "unga yetkaziladi.\n\n"
     "/stats — umumiy statistika\n"
-    "/bought — sotib olingan videolar ro'yxati (narxi bilan)"
+    "/bought — sotib olingan videolar ro'yxati (narxi bilan)\n"
+    "/broadcast — barcha foydalanuvchilarga ommaviy xabar yuborish"
 )
 
 
@@ -93,8 +108,8 @@ async def cmd_bought(message: Message) -> None:
     for row in rows:
         price = row["price"] or 0
         total += price
-        uname = f"@{row['username']}" if row["username"] else "username yo'q"
-        name = row["full_name"] or "Noma'lum"
+        uname = f"@{html.escape(row['username'])}" if row["username"] else "username yo'q"
+        name = html.escape(row["full_name"] or "Noma'lum")
         date = (row["created_at"] or "")[:10]
         lines.append(f"#{row['ticket_id']} — {name} ({uname}) — {fmt_price(price)} so'm — {date}")
 
@@ -185,6 +200,157 @@ async def _refresh_header(bot: Bot, ticket_id: int) -> None:
             reply_markup=video_status_kb(ticket_id),
         )
     except TelegramBadRequest:
+        pass
+
+
+# ---------- ommaviy xabar yuborish (broadcast) ----------
+
+@router.message(Command("broadcast"))
+async def cmd_broadcast(message: Message, state: FSMContext) -> None:
+    if _broadcast_running:
+        await message.reply(
+            "⏳ Hozir boshqa ommaviy xabar yuborilmoqda. Iltimos, tugashini kuting."
+        )
+        return
+
+    count = await db.count_broadcastable_users()
+    await state.set_state(AdminStates.awaiting_broadcast_content)
+    await message.answer(
+        f"📢 <b>Ommaviy xabar yuborish</b>\n\n"
+        f"Hozircha bazada <b>{fmt_price(count)}</b> kishiga yuborish mumkin "
+        "(botni bloklaganlar hisobga olinmaydi).\n\n"
+        "Yubormoqchi bo'lgan xabaringizni shu yerga yuboring (matn, rasm yoki "
+        "video bo'lishi mumkin — nima yuborsangiz, aynan o'shanday hammaga "
+        "yetadi). Bekor qilish uchun \"bekor\" deb yozing."
+    )
+
+
+@router.message(StateFilter(AdminStates.awaiting_broadcast_content))
+async def receive_broadcast_content(message: Message, state: FSMContext) -> None:
+    if (message.text or "").strip().lower() in ("bekor", "bekor qilish", "/cancel", "cancel"):
+        await state.clear()
+        await message.answer("Bekor qilindi.")
+        return
+
+    count = await db.count_broadcastable_users()
+    await state.update_data(broadcast_chat_id=message.chat.id, broadcast_message_id=message.message_id)
+    # Endi xabar-kutish holatidan chiqamiz (tugmalar orqali davom etadi),
+    # lekin saqlangan ma'lumot (broadcast_chat_id/message_id) FSM state
+    # tozalanmagani uchun saqlanib qoladi.
+    await state.set_state(None)
+    await message.answer(
+        f"⬆️ Xabaringiz shu (yuqorida). Buni <b>{fmt_price(count)}</b> kishiga "
+        "yubormoqchimisiz?",
+        reply_markup=broadcast_confirm_kb(),
+    )
+
+
+@router.callback_query(F.data == "bc:cancel")
+async def cb_broadcast_cancel(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except TelegramBadRequest:
+        pass
+    await callback.message.answer("Bekor qilindi.")
+    await callback.answer()
+
+
+@router.callback_query(F.data == "bc:send")
+async def cb_broadcast_send(callback: CallbackQuery, state: FSMContext, bot: Bot) -> None:
+    global _broadcast_running
+    if _broadcast_running:
+        await callback.answer("Hozir boshqa yuborish jarayoni ketyapti.", show_alert=True)
+        return
+
+    data = await state.get_data()
+    source_chat_id = data.get("broadcast_chat_id")
+    source_message_id = data.get("broadcast_message_id")
+    await state.clear()
+
+    if not source_chat_id or not source_message_id:
+        await callback.answer(
+            "⚠️ Xatolik: xabar topilmadi, qaytadan /broadcast bosing.", show_alert=True
+        )
+        return
+
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except TelegramBadRequest:
+        pass
+    await callback.message.answer(
+        "⏳ Yuborish boshlandi... Bu bir necha o'n daqiqa davom etishi mumkin "
+        "(minglab odam bo'lgani uchun), tugagach xabar beraman."
+    )
+    await callback.answer("Boshlandi ✅")
+
+    _broadcast_running = True
+    asyncio.create_task(
+        _run_broadcast(bot, callback.message.chat.id, source_chat_id, source_message_id)
+    )
+
+
+async def _run_broadcast(
+    bot: Bot, admin_chat_id: int, source_chat_id: int, source_message_id: int
+) -> None:
+    """Fonda ishlaydi (bot bloklanib qolmasligi uchun) — barcha bloklamagan
+    foydalanuvchilarga xabarni ketma-ket yuboradi, Telegram'ning flood-control
+    chegarasidan oshib ketmaslik uchun har bir xabar orasida qisqa pauza
+    qiladi."""
+    global _broadcast_running
+    user_ids = await db.list_broadcastable_user_ids()
+    total = len(user_ids)
+    sent = 0
+    blocked_now = 0
+    failed = 0
+
+    for uid in user_ids:
+        try:
+            await bot.copy_message(
+                chat_id=uid, from_chat_id=source_chat_id, message_id=source_message_id
+            )
+            sent += 1
+        except TelegramRetryAfter as exc:
+            await asyncio.sleep(exc.retry_after + 0.5)
+            try:
+                await bot.copy_message(
+                    chat_id=uid, from_chat_id=source_chat_id, message_id=source_message_id
+                )
+                sent += 1
+            except Exception:
+                failed += 1
+        except TelegramForbiddenError:
+            blocked_now += 1
+            await db.set_user_blocked(uid, True)
+        except Exception as exc:  # noqa: BLE001 - bitta xato butun jarayonni to'xtatmasligi kerak
+            failed += 1
+            logger.warning("Broadcast: %s ga yuborib bo'lmadi: %s", uid, exc)
+
+        processed = sent + blocked_now + failed
+        if processed % 2000 == 0:
+            try:
+                await bot.send_message(
+                    admin_chat_id,
+                    f"⏳ {fmt_price(processed)}/{fmt_price(total)} — "
+                    f"{fmt_price(sent)} yuborildi, {fmt_price(blocked_now)} bloklagan, "
+                    f"{fmt_price(failed)} xato.",
+                )
+            except Exception:
+                pass
+
+        await asyncio.sleep(0.05)  # ~20 xabar/soniya — flood-control'dan xavfsiz chegara
+
+    _broadcast_running = False
+    try:
+        await bot.send_message(
+            admin_chat_id,
+            "✅ <b>Ommaviy xabar yuborish tugadi!</b>\n\n"
+            f"📨 Yuborildi: {fmt_price(sent)}\n"
+            f"🚫 Bloklagan (endi belgilandi): {fmt_price(blocked_now)}\n"
+            f"⚠️ Xato: {fmt_price(failed)}\n"
+            f"👥 Jami urinildi: {fmt_price(total)}",
+        )
+    except Exception:
         pass
 
 
