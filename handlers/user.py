@@ -5,11 +5,13 @@ handlers/admin.py da alohida ishlanadi, shunda admin botga /start bossa
 mijozlar menyusini emas, balki admin panelni ko'radi.
 """
 
+import asyncio
 import logging
 from typing import Awaitable, Callable, List
 
 from aiogram import Bot, F, Router
-from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
+from aiogram.enums import ContentType
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
 from aiogram.filters import CommandStart
 from aiogram.types import CallbackQuery, Message
 
@@ -54,6 +56,28 @@ def _fmt_price(n: int) -> str:
     return f"{n:,}".replace(",", " ")
 
 
+# Bu turdagi xabarlarga (rasm/video/hujjat va h.k.) caption qo'shish mumkin —
+# shu orqali kimdan kelganini pastda ko'rsatamiz.
+CAPTIONABLE_TYPES = {
+    ContentType.PHOTO,
+    ContentType.VIDEO,
+    ContentType.DOCUMENT,
+    ContentType.AUDIO,
+    ContentType.ANIMATION,
+    ContentType.VOICE,
+}
+
+
+def _build_sender_caption(message: Message, ticket_id: int, phone: str | None) -> str:
+    uname = f"@{message.from_user.username}" if message.from_user.username else "username yo'q"
+    phone_line = f"\n📱 {phone}" if phone else ""
+    return (
+        f"👤 {message.from_user.full_name} ({uname})\n"
+        f"🆔 {message.from_user.id}{phone_line}\n"
+        f"🎫 Ticket #{ticket_id}"
+    )
+
+
 VIDEO_INTRO_TEXT = (
     "🎥 <b>Video sotish</b>\n\n"
     "Hali hech qayerda chiqmagan videongiz bo'lsa, biz undan sotib olishimiz "
@@ -86,6 +110,42 @@ async def _is_subscribed(bot: Bot, user_id: int) -> bool:
         return True
 
 
+async def _send_to_one_admin(
+    admin_id: int, sender: Callable[[int], Awaitable[Message]]
+) -> Message | None:
+    """Bitta adminga xabar yuborishga urinadi, flood-control (429/RetryAfter)
+    holatida ko'rsatilgan vaqtcha kutib qayta uradi (video/media kabi katta
+    xabarlarni bir nechta chatga ketma-ket yuborganda Telegram shuni talab
+    qilib qolishi mumkin — shu sabab ba'zi adminlarga yetib bormasligi
+    mumkin edi, chunki bu holat ilgari umuman ushlanmagan edi)."""
+    for attempt in range(3):
+        try:
+            return await sender(admin_id)
+        except TelegramRetryAfter as exc:
+            logger.warning(
+                "Admin %s ga yuborishda flood-control: %s soniya kutib, qayta "
+                "urinilmoqda (%s-urinish)",
+                admin_id,
+                exc.retry_after,
+                attempt + 1,
+            )
+            await asyncio.sleep(exc.retry_after + 0.5)
+            continue
+        except (TelegramForbiddenError, TelegramBadRequest) as exc:
+            logger.warning(
+                "Admin %s ga yuborib bo'lmadi (botni ishga tushirmagan/bloklagan "
+                "bo'lishi mumkin): %s",
+                admin_id,
+                exc,
+            )
+            return None
+        except Exception as exc:  # kutilmagan xato — logga yozib, keyingi adminga o'tamiz
+            logger.exception("Admin %s ga yuborishda kutilmagan xatolik: %s", admin_id, exc)
+            return None
+    logger.error("Admin %s ga uch urinishdan keyin ham yuborib bo'lmadi (flood-control).", admin_id)
+    return None
+
+
 async def _send_to_admins(
     ticket_id: int, sender: Callable[[int], Awaitable[Message]]
 ) -> List[Message]:
@@ -100,17 +160,16 @@ async def _send_to_admins(
     """
     sent_messages: List[Message] = []
     for admin_id in cfg.admin_ids:
-        try:
-            sent = await sender(admin_id)
-        except (TelegramForbiddenError, TelegramBadRequest) as exc:
-            logger.warning(
-                "Admin %s ga yuborib bo'lmadi (botni ishga tushirmagan/bloklagan "
-                "bo'lishi mumkin): %s",
-                admin_id,
-                exc,
-            )
+        sent = await _send_to_one_admin(admin_id, sender)
+        if sent is None:
             continue
-        await db.link_admin_message(ticket_id, sent.chat.id, sent.message_id)
+        # Eslatma: `bot.copy_message()` Telegram API darajasida faqat
+        # `MessageId` obyektini qaytaradi (unda `.chat` maydoni yo'q,
+        # faqat `.message_id`) — `sent.chat.id` o'rniga allaqachon ma'lum
+        # bo'lgan `admin_id`dan foydalanamiz. Aynan shu joyda oldin
+        # AttributeError chiqib, sikl birinchi admindan keyin to'xtab
+        # qolar, videoni faqat birinchi adminga yetkazib ulgurar edi.
+        await db.link_admin_message(ticket_id, admin_id, sent.message_id)
         sent_messages.append(sent)
     return sent_messages
 
@@ -121,10 +180,8 @@ async def _broadcast_to_admins(sender: Callable[[int], Awaitable[Message]]) -> L
     tugma orqali boshqariladi)."""
     sent_messages: List[Message] = []
     for admin_id in cfg.admin_ids:
-        try:
-            sent = await sender(admin_id)
-        except (TelegramForbiddenError, TelegramBadRequest) as exc:
-            logger.warning("Admin %s ga yuborib bo'lmadi: %s", admin_id, exc)
+        sent = await _send_to_one_admin(admin_id, sender)
+        if sent is None:
             continue
         sent_messages.append(sent)
     return sent_messages
@@ -415,12 +472,41 @@ async def _relay_to_admin(message: Message) -> bool:
         )
         return False
 
-    sent_list = await _send_to_admins(
-        ticket_id,
-        lambda admin_id: message.bot.copy_message(
+    # Video qaysi yo'l bilan yuborilishidan qat'i nazar (masalan "Oddiy
+    # murojaat" ichida ham) — agar foydalanuvchining telefon raqami hali
+    # bizda yo'q bo'lsa, avval shuni so'raymiz. Video shu joyda "yo'qoladi"
+    # (yuborilmaydi) — foydalanuvchi telefon ulashgach, uni qayta yuborishi
+    # kerak bo'ladi.
+    if message.video and not user["phone"]:
+        await db.set_awaiting_phone(message.from_user.id, True)
+        await message.answer(
+            "🎥 Video qabul qilishdan oldin telefon raqamingizni bilishimiz "
+            "kerak. Iltimos, pastdagi tugma orqali raqamingizni yuboring — "
+            "shundan keyin videongizni qayta yuborasiz.",
+            reply_markup=phone_request_kb(),
+        )
+        return False
+
+    identity = _build_sender_caption(message, ticket_id, user["phone"])
+
+    async def _copy_with_identity(admin_id: int) -> Message:
+        if message.content_type in CAPTIONABLE_TYPES:
+            base_caption = message.caption or ""
+            new_caption = f"{identity}\n\n{base_caption}" if base_caption else identity
+            if len(new_caption) > 1024:
+                new_caption = new_caption[:1021] + "..."
+            return await message.bot.copy_message(
+                chat_id=admin_id,
+                from_chat_id=message.chat.id,
+                message_id=message.message_id,
+                caption=new_caption,
+                parse_mode=None,
+            )
+        return await message.bot.copy_message(
             chat_id=admin_id, from_chat_id=message.chat.id, message_id=message.message_id
-        ),
-    )
+        )
+
+    sent_list = await _send_to_admins(ticket_id, _copy_with_identity)
     if not sent_list:
         await message.answer("Xatolik yuz berdi, birozdan so'ng qayta urinib ko'ring.")
         return False
