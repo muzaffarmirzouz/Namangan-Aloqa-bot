@@ -37,6 +37,7 @@ async def init_db(db_path: str) -> None:
                 phone TEXT,
                 active_ticket_id INTEGER,
                 awaiting_phone INTEGER DEFAULT 0,
+                awaiting_card INTEGER DEFAULT 0,
                 is_blocked INTEGER DEFAULT 0,
                 balance INTEGER DEFAULT 0,
                 created_at TEXT
@@ -80,17 +81,20 @@ async def init_db(db_path: str) -> None:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_tg_id INTEGER NOT NULL,
                 amount INTEGER NOT NULL,
+                card TEXT,
                 status TEXT DEFAULT 'so_ralgan',
                 created_at TEXT
             )
             """
         )
-        # Eski (price/balance ustunisiz) bazalar bilan moslik uchun — agar
+        # Eski (price/balance/card ustunisiz) bazalar bilan moslik uchun — agar
         # jadval allaqachon mavjud bo'lsa-yu, ustun bo'lmasa, shu yerda
         # qo'shamiz.
         for alter_sql in (
             "ALTER TABLE tickets ADD COLUMN price INTEGER",
             "ALTER TABLE users ADD COLUMN balance INTEGER DEFAULT 0",
+            "ALTER TABLE users ADD COLUMN awaiting_card INTEGER DEFAULT 0",
+            "ALTER TABLE withdrawals ADD COLUMN card TEXT",
         ):
             try:
                 await db.execute(alter_sql)
@@ -126,6 +130,14 @@ async def set_awaiting_phone(tg_id: int, value: bool) -> None:
     async with aiosqlite.connect(_db_path) as db:
         await db.execute(
             "UPDATE users SET awaiting_phone = ? WHERE tg_id = ?", (1 if value else 0, tg_id)
+        )
+        await db.commit()
+
+
+async def set_awaiting_card(tg_id: int, value: bool) -> None:
+    async with aiosqlite.connect(_db_path) as db:
+        await db.execute(
+            "UPDATE users SET awaiting_card = ? WHERE tg_id = ?", (1 if value else 0, tg_id)
         )
         await db.commit()
 
@@ -243,11 +255,11 @@ async def find_ticket_by_admin_message(admin_chat_id: int, admin_message_id: int
 
 # ---------- withdrawals (balansni yechib olish) ----------
 
-async def create_withdrawal(user_tg_id: int, amount: int) -> int:
+async def create_withdrawal(user_tg_id: int, amount: int, card: Optional[str] = None) -> int:
     async with aiosqlite.connect(_db_path) as db:
         cur = await db.execute(
-            "INSERT INTO withdrawals (user_tg_id, amount, created_at) VALUES (?, ?, ?)",
-            (user_tg_id, amount, _now()),
+            "INSERT INTO withdrawals (user_tg_id, amount, card, created_at) VALUES (?, ?, ?, ?)",
+            (user_tg_id, amount, card, _now()),
         )
         await db.commit()
         return cur.lastrowid
