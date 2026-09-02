@@ -77,6 +77,14 @@ async def init_db(db_path: str) -> None:
         )
         await db.execute(
             """
+            CREATE TABLE IF NOT EXISTS meta (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            )
+            """
+        )
+        await db.execute(
+            """
             CREATE TABLE IF NOT EXISTS withdrawals (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_tg_id INTEGER NOT NULL,
@@ -132,6 +140,30 @@ async def set_awaiting_phone(tg_id: int, value: bool) -> None:
             "UPDATE users SET awaiting_phone = ? WHERE tg_id = ?", (1 if value else 0, tg_id)
         )
         await db.commit()
+
+
+async def set_user_blocked(tg_id: int, value: bool) -> None:
+    async with aiosqlite.connect(_db_path) as db:
+        await db.execute(
+            "UPDATE users SET is_blocked = ? WHERE tg_id = ?", (1 if value else 0, tg_id)
+        )
+        await db.commit()
+
+
+async def count_broadcastable_users() -> int:
+    async with aiosqlite.connect(_db_path) as db:
+        cur = await db.execute("SELECT COUNT(*) FROM users WHERE is_blocked = 0")
+        row = await cur.fetchone()
+        return row[0] if row else 0
+
+
+async def list_broadcastable_user_ids() -> list[int]:
+    """Bloklamagan foydalanuvchilarning tg_id ro'yxati (ommaviy xabar
+    yuborish uchun)."""
+    async with aiosqlite.connect(_db_path) as db:
+        cur = await db.execute("SELECT tg_id FROM users WHERE is_blocked = 0")
+        rows = await cur.fetchall()
+        return [row[0] for row in rows]
 
 
 async def set_awaiting_card(tg_id: int, value: bool) -> None:
@@ -348,3 +380,63 @@ async def list_bought_videos(limit: int = 20):
             (limit,),
         )
         return await cur.fetchall()
+
+
+# ---------- eski foydalanuvchilar ro'yxatini bir martalik import qilish ----------
+
+async def import_legacy_users(csv_path: str) -> Optional[int]:
+    """Eski bot(lar)dan eksport qilingan foydalanuvchilar ro'yxatini (CSV:
+    tg_id,full_name,username,phone,is_blocked) bazaga qo'shadi.
+
+    Faqat BIR MARTA ishlaydi — `meta` jadvalidagi belgi orqali nazorat
+    qilinadi, shuning uchun bot qayta-qayta ishga tushsa (masalan Railway
+    qayta deploy qilganda) ham takrorlanmaydi/dublikat yaratmaydi.
+
+    Agar foydalanuvchi allaqachon bazada bo'lsa (masalan yangi botda o'zi
+    biror amal qilgan bo'lsa), uning mavjud ma'lumotlari ustidan YOZILMAYDI —
+    faqat bo'sh maydonlar (masalan telefon) to'ldiriladi.
+
+    Qaytaradi: import qilingan qatorlar soni, yoki `None` (agar allaqachon
+    import qilingan bo'lsa — qayta ishlanmaydi).
+    """
+    import csv as _csv
+
+    async with aiosqlite.connect(_db_path) as db:
+        cur = await db.execute("SELECT value FROM meta WHERE key = 'legacy_users_imported'")
+        already = await cur.fetchone()
+        if already is not None:
+            return None
+
+        rows = []
+        with open(csv_path, encoding="utf-8") as f:
+            reader = _csv.DictReader(f)
+            for r in reader:
+                try:
+                    tg_id = int(r["tg_id"])
+                except (KeyError, ValueError, TypeError):
+                    continue
+                username = (r.get("username") or "").strip() or None
+                full_name = (r.get("full_name") or "").strip() or "Noma'lum"
+                phone = (r.get("phone") or "").strip() or None
+                is_blocked = 1 if (r.get("is_blocked") or "0").strip() == "1" else 0
+                rows.append((tg_id, username, full_name, phone, is_blocked, _now()))
+
+        if rows:
+            await db.executemany(
+                """
+                INSERT INTO users (tg_id, username, full_name, phone, is_blocked, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(tg_id) DO UPDATE SET
+                    username = COALESCE(users.username, excluded.username),
+                    full_name = COALESCE(NULLIF(users.full_name, ''), excluded.full_name),
+                    phone = COALESCE(users.phone, excluded.phone),
+                    is_blocked = MAX(users.is_blocked, excluded.is_blocked)
+                """,
+                rows,
+            )
+        await db.execute(
+            "INSERT INTO meta (key, value) VALUES ('legacy_users_imported', ?)",
+            (str(len(rows)),),
+        )
+        await db.commit()
+        return len(rows)

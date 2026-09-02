@@ -6,6 +6,7 @@ Talab qilinadigan muhit o'zgaruvchilari uchun .env.example fayliga qarang.
 
 import asyncio
 import logging
+import os
 
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
@@ -26,6 +27,20 @@ async def main() -> None:
 
     await db.init_db(cfg.db_path)
     logger.info("Ma'lumotlar bazasi tayyor: %s", cfg.db_path)
+
+    # Eski bot(lar)dan eksport qilingan foydalanuvchilar ro'yxati bo'lsa
+    # (import_users.csv), bir martalik import qilamiz. Fayl bo'lmasa yoki
+    # allaqachon import qilingan bo'lsa, shunchaki o'tkazib yuboriladi.
+    legacy_csv = os.path.join(os.path.dirname(__file__), "import_users.csv")
+    if os.path.exists(legacy_csv):
+        try:
+            imported = await db.import_legacy_users(legacy_csv)
+            if imported is None:
+                logger.info("Eski foydalanuvchilar ro'yxati allaqachon import qilingan.")
+            else:
+                logger.info("Eski foydalanuvchilar ro'yxatidan %s ta yozuv import qilindi.", imported)
+        except Exception:
+            logger.exception("Eski foydalanuvchilar ro'yxatini import qilishda xatolik.")
 
     bot = Bot(
         token=cfg.bot_token,
