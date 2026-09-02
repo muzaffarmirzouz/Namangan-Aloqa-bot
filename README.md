@@ -41,8 +41,10 @@ da yozilgan, ma'lumotlar SQLite'da saqlanadi.
      nechta video sotsa, hammasi qo'shilib boradi). Foydalanuvchi asosiy
      menyudagi **"💰 Balansim"** tugmasi orqali istalgan payt balansini
      ko'rishi mumkin.
-   - Foydalanuvchi **"💳 Hoziroq yechib olish"** tugmasini bossa, sizga
-     (adminga) so'rov keladi — ism, telefon raqami va summasi bilan.
+   - Foydalanuvchi **"💳 Hoziroq yechib olish"** tugmasini bossa, bot avval
+     undan **karta raqamini so'raydi**. Karta raqami yuborilgach, sizga
+     (adminga) so'rov keladi — ism, telefon raqami, karta raqami va summasi
+     bilan.
    - Siz to'lovni qo'lda amalga oshirgach (karta/naqd), **"✅ To'ladim"**
      tugmasini bosasiz — shunda foydalanuvchiga "pul tushdimi?" deb so'rov
      ketadi.

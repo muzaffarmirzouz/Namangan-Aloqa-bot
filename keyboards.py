@@ -34,6 +34,15 @@ def phone_request_kb() -> ReplyKeyboardMarkup:
     )
 
 
+def card_request_kb() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text=BTN_CANCEL)],
+        ],
+        resize_keyboard=True,
+    )
+
+
 def video_upload_kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
