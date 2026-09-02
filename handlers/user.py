@@ -6,6 +6,7 @@ mijozlar menyusini emas, balki admin panelni ko'radi.
 """
 
 import asyncio
+import html
 import logging
 from typing import Awaitable, Callable, List
 
@@ -24,6 +25,7 @@ from keyboards import (
     BTN_DONE,
     BTN_SELL_VIDEO,
     balance_withdraw_kb,
+    card_request_kb,
     main_menu_kb,
     phone_request_kb,
     subscribe_kb,
@@ -217,6 +219,7 @@ async def cb_check_sub(callback: CallbackQuery, bot: Bot) -> None:
 @router.message(F.text == BTN_CANCEL)
 async def cancel_flow(message: Message) -> None:
     await db.set_awaiting_phone(message.from_user.id, False)
+    await db.set_awaiting_card(message.from_user.id, False)
     await db.set_active_ticket(message.from_user.id, None)
     await message.answer("Bekor qilindi. Asosiy menyu 👇", reply_markup=main_menu_kb())
 
@@ -297,34 +300,69 @@ async def cb_withdraw_request(callback: CallbackQuery) -> None:
         await callback.answer("Balansingiz bo'sh.", show_alert=True)
         return
 
-    withdrawal_id = await db.create_withdrawal(callback.from_user.id, balance)
-
-    full_name = user["full_name"] if user and user["full_name"] else callback.from_user.full_name
-    uname = f"@{user['username']}" if user and user["username"] else "username yo'q"
-    phone = user["phone"] if user and user["phone"] else "noma'lum"
-    text = (
-        f"💳 <b>Yechib olish so'rovi</b> #{withdrawal_id}\n"
-        f"👤 {full_name} ({uname})\n"
-        f"🆔 <code>{callback.from_user.id}</code>\n"
-        f"📱 <code>{phone}</code>\n"
-        f"💰 Summa: <b>{_fmt_price(balance)} so'm</b>\n\n"
-        "To'lovni amalga oshirgach (karta/naqd orqali), pastdagi tugmani bosing."
-    )
-    await _broadcast_to_admins(
-        lambda admin_id: callback.bot.send_message(
-            admin_id, text, reply_markup=withdrawal_admin_kb(withdrawal_id)
-        )
-    )
+    await db.set_awaiting_card(callback.from_user.id, True)
 
     try:
         await callback.message.edit_reply_markup(reply_markup=None)
     except TelegramBadRequest:
         pass
     await callback.message.answer(
-        "✅ So'rovingiz qabul qilindi. Admin tez orada siz bilan bog'lanib, "
-        "to'lovni amalga oshiradi."
+        "💳 Pulni qaysi karta raqamiga o'tkazib berishimiz kerak? Iltimos, "
+        "karta raqamingizni yuboring (masalan: 8600 1234 5678 9012).",
+        reply_markup=card_request_kb(),
     )
     await callback.answer()
+
+
+async def _process_card_number(message: Message, user) -> None:
+    """Foydalanuvchi balansini yechib olish uchun karta raqamini yuborganda
+    ishga tushadi — so'rovni yaratadi va adminlarga xabar beradi."""
+    card = (message.text or "").strip()
+    digits_only = "".join(ch for ch in card if ch.isdigit())
+    if len(digits_only) < 8:
+        await message.answer(
+            "Iltimos, to'g'ri karta raqamini yuboring (masalan: "
+            "8600 1234 5678 9012) yoki bekor qiling.",
+            reply_markup=card_request_kb(),
+        )
+        return
+
+    await db.set_awaiting_card(message.from_user.id, False)
+
+    # Balansni qayta o'qiymiz — bu vaqt oralig'ida o'zgargan bo'lishi mumkin
+    fresh_user = await db.get_user(message.from_user.id) or user
+    balance = fresh_user["balance"] if fresh_user else 0
+    if balance <= 0:
+        await message.answer("Balansingiz bo'sh.", reply_markup=main_menu_kb())
+        return
+
+    withdrawal_id = await db.create_withdrawal(message.from_user.id, balance, card)
+
+    full_name = (
+        fresh_user["full_name"] if fresh_user and fresh_user["full_name"] else message.from_user.full_name
+    )
+    uname = f"@{fresh_user['username']}" if fresh_user and fresh_user["username"] else "username yo'q"
+    phone = fresh_user["phone"] if fresh_user and fresh_user["phone"] else "noma'lum"
+    text = (
+        f"💳 <b>Yechib olish so'rovi</b> #{withdrawal_id}\n"
+        f"👤 {html.escape(full_name)} ({html.escape(uname)})\n"
+        f"🆔 <code>{message.from_user.id}</code>\n"
+        f"📱 <code>{html.escape(phone)}</code>\n"
+        f"💳 Karta: <code>{html.escape(card)}</code>\n"
+        f"💰 Summa: <b>{_fmt_price(balance)} so'm</b>\n\n"
+        "To'lovni shu kartaga amalga oshirgach, pastdagi tugmani bosing."
+    )
+    await _broadcast_to_admins(
+        lambda admin_id: message.bot.send_message(
+            admin_id, text, reply_markup=withdrawal_admin_kb(withdrawal_id)
+        )
+    )
+
+    await message.answer(
+        "✅ So'rovingiz qabul qilindi. Admin tez orada tekshirib, to'lovni "
+        "amalga oshiradi.",
+        reply_markup=main_menu_kb(),
+    )
 
 
 @router.callback_query(F.data.startswith("wd:"))
@@ -369,6 +407,26 @@ async def cb_withdraw_confirm(callback: CallbackQuery, bot: Bot) -> None:
             f"{_fmt_price(new_balance)} so'm.",
         )
     )
+
+
+@router.message(F.text)
+async def receive_text(message: Message) -> None:
+    """Har qanday matnli xabar shu yerga tushadi. Agar foydalanuvchi hozir
+    karta raqami yuborishini kutayotgan bo'lsak (balansni yechib olish
+    oqimi), shu yerda ishlaymiz — aks holda odatdagidek adminga relay
+    qilamiz (murojaat matni va h.k.)."""
+    user = await db.get_user(message.from_user.id)
+    if not user:
+        await db.get_or_create_user(
+            message.from_user.id, message.from_user.username, message.from_user.full_name
+        )
+        user = await db.get_user(message.from_user.id)
+
+    if user and user["awaiting_card"]:
+        await _process_card_number(message, user)
+        return
+
+    await _relay_to_admin(message)
 
 
 @router.message(F.contact)
