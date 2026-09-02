@@ -1,0 +1,427 @@
+"""Oddiy foydalanuvchilar (kanal a'zolari) bilan ishlaydigan handlerlar.
+
+Adminlarning o'zi (cfg.admin_ids ichidagilar) bu routerga tushmaydi — ular
+handlers/admin.py da alohida ishlanadi, shunda admin botga /start bossa
+mijozlar menyusini emas, balki admin panelni ko'radi.
+"""
+
+import logging
+from typing import Awaitable, Callable, List
+
+from aiogram import Bot, F, Router
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
+from aiogram.filters import CommandStart
+from aiogram.types import CallbackQuery, Message
+
+import database as db
+from config import cfg
+from keyboards import (
+    BTN_APPEAL,
+    BTN_BALANCE,
+    BTN_CANCEL,
+    BTN_DONE,
+    BTN_SELL_VIDEO,
+    balance_withdraw_kb,
+    main_menu_kb,
+    phone_request_kb,
+    subscribe_kb,
+    video_status_kb,
+    video_upload_kb,
+    withdrawal_admin_kb,
+)
+from utils import build_appeal_header, build_video_header
+
+router = Router(name="user")
+router.message.filter(F.chat.type == "private", ~F.from_user.id.in_(cfg.admin_ids))
+
+logger = logging.getLogger(__name__)
+
+WELCOME_TEXT = (
+    "Assalomu alaykum! 👋\n\n"
+    "Bu — <b>Namanganliklar.uz</b> kanali admin bilan aloqa boti.\n\n"
+    "✉️ <b>Oddiy murojaat</b> — savol, taklif, shikoyat yoki biror voqea haqida "
+    "xabar bermoqchi bo'lsangiz shu tugmani bosing. Adminlar ko'rib chiqib javob "
+    "qaytaradi.\n\n"
+    "🎥 <b>Video sotaman</b> — hech qayerda chiqmagan, o'zingiz suratga olgan "
+    "shov-shuvli/tezkor video (avariya, baxtsiz hodisa va h.k.) bo'lsa, shu "
+    "tugma orqali yuboring.\n\n"
+    "💰 <b>Balansim</b> — sotib olingan videolaringiz uchun to'langan summani "
+    "shu yerdan kuzatib borasiz."
+)
+
+
+def _fmt_price(n: int) -> str:
+    return f"{n:,}".replace(",", " ")
+
+
+VIDEO_INTRO_TEXT = (
+    "🎥 <b>Video sotish</b>\n\n"
+    "Hali hech qayerda chiqmagan videongiz bo'lsa, biz undan sotib olishimiz "
+    "mumkin.\n\n"
+    "⚠️ <b>Muhim eslatmalar:</b>\n"
+    "📹 Video <b>tiniq, sifatli</b> bo'lishi va undagi ma'lumotlar (joy, vaqt, "
+    "voqea) <b>aniq</b> bo'lishi shart.\n"
+    "💰 To'lov video <b>kanalga chiqqandan (e'lon qilingandan) keyin</b> "
+    "amalga oshiriladi.\n"
+    "⚖️ Noto'g'ri yoki yolg'on ma'lumot bergan bo'lsangiz, javobgarlik "
+    "to'liq <b>o'zingizga</b> yuklanadi.\n"
+    "🔒 Sizning shaxsingiz <b>sir saqlanishi kafolatlanadi</b> — ismingiz va "
+    "ma'lumotlaringiz hech qachon oshkor qilinmaydi.\n\n"
+    f"💵 Narx holatiga qarab <b>{_fmt_price(cfg.min_video_price)}–"
+    f"{_fmt_price(cfg.max_video_price)} so'm</b> oralig'ida belgilanadi "
+    f"(eng kami {_fmt_price(cfg.min_video_price)} so'm).\n\n"
+    "Davom etish uchun profilingizdagi telefon raqamni yuboring 👇"
+)
+
+
+async def _is_subscribed(bot: Bot, user_id: int) -> bool:
+    if not cfg.require_subscription or not cfg.channel_username:
+        return True
+    try:
+        member = await bot.get_chat_member(chat_id=f"@{cfg.channel_username.lstrip('@')}", user_id=user_id)
+        return member.status not in ("left", "kicked")
+    except TelegramBadRequest as exc:
+        logger.warning("Obunani tekshirib bo'lmadi: %s", exc)
+        # Sozlamada xato bo'lsa foydalanuvchini bloklab qo'ymaslik uchun ruxsat beramiz
+        return True
+
+
+async def _send_to_admins(
+    ticket_id: int, sender: Callable[[int], Awaitable[Message]]
+) -> List[Message]:
+    """Ticketga tegishli xabarni har bir adminning shaxsiy chatiga yuboradi.
+
+    `sender(admin_id)` — bitta adminga xabar yuboruvchi async funksiya
+    (masalan `bot.send_message` yoki `bot.copy_message` chaqirig'i).
+    Muvaffaqiyatli yetkazilgan har bir xabar ticketga bog'lanadi (shu orqali
+    o'sha admin keyinchalik shu xabarga reply qilib javob bera oladi).
+    Admin botni hali ishga tushirmagan yoki bloklagan bo'lsa, shunchaki
+    o'tkazib yuboriladi.
+    """
+    sent_messages: List[Message] = []
+    for admin_id in cfg.admin_ids:
+        try:
+            sent = await sender(admin_id)
+        except (TelegramForbiddenError, TelegramBadRequest) as exc:
+            logger.warning(
+                "Admin %s ga yuborib bo'lmadi (botni ishga tushirmagan/bloklagan "
+                "bo'lishi mumkin): %s",
+                admin_id,
+                exc,
+            )
+            continue
+        await db.link_admin_message(ticket_id, sent.chat.id, sent.message_id)
+        sent_messages.append(sent)
+    return sent_messages
+
+
+async def _broadcast_to_admins(sender: Callable[[int], Awaitable[Message]]) -> List[Message]:
+    """`_send_to_admins`ga o'xshaydi, lekin ticketga bog'lamaydi — masalan
+    balansni yechib olish so'rovlari uchun (bu alohida reply-suhbat emas,
+    tugma orqali boshqariladi)."""
+    sent_messages: List[Message] = []
+    for admin_id in cfg.admin_ids:
+        try:
+            sent = await sender(admin_id)
+        except (TelegramForbiddenError, TelegramBadRequest) as exc:
+            logger.warning("Admin %s ga yuborib bo'lmadi: %s", admin_id, exc)
+            continue
+        sent_messages.append(sent)
+    return sent_messages
+
+
+@router.message(CommandStart())
+async def cmd_start(message: Message, bot: Bot) -> None:
+    await db.get_or_create_user(
+        message.from_user.id, message.from_user.username, message.from_user.full_name
+    )
+
+    if not await _is_subscribed(bot, message.from_user.id):
+        await message.answer(
+            "Botdan foydalanish uchun avval kanalimizga obuna bo'ling, so'ng "
+            "\"✅ Tekshirish\" tugmasini bosing.",
+            reply_markup=subscribe_kb(cfg.channel_username),
+        )
+        return
+
+    await message.answer(WELCOME_TEXT, reply_markup=main_menu_kb())
+
+
+@router.callback_query(F.data == "check_sub")
+async def cb_check_sub(callback: CallbackQuery, bot: Bot) -> None:
+    if await _is_subscribed(bot, callback.from_user.id):
+        await callback.message.delete()
+        await callback.message.answer(WELCOME_TEXT, reply_markup=main_menu_kb())
+        await callback.answer("Rahmat!")
+    else:
+        await callback.answer("Hali kanalga obuna bo'lmagansiz.", show_alert=True)
+
+
+@router.message(F.text == BTN_CANCEL)
+async def cancel_flow(message: Message) -> None:
+    await db.set_awaiting_phone(message.from_user.id, False)
+    await db.set_active_ticket(message.from_user.id, None)
+    await message.answer("Bekor qilindi. Asosiy menyu 👇", reply_markup=main_menu_kb())
+
+
+@router.message(F.text == BTN_DONE)
+async def finish_video_upload(message: Message) -> None:
+    user = await db.get_user(message.from_user.id)
+    if not user or not user["active_ticket_id"]:
+        await message.answer("Faol murojaat topilmadi.", reply_markup=main_menu_kb())
+        return
+    await db.set_active_ticket(message.from_user.id, None)
+    await message.answer(
+        "Rahmat! Videongiz adminlarga yuborildi, tez orada bog'lanishadi. ✅",
+        reply_markup=main_menu_kb(),
+    )
+
+
+@router.message(F.text == BTN_APPEAL)
+async def start_appeal(message: Message) -> None:
+    await db.set_awaiting_phone(message.from_user.id, False)
+    ticket_id = await db.create_ticket(message.from_user.id, kind="appeal")
+    await db.set_active_ticket(message.from_user.id, ticket_id)
+
+    header = build_appeal_header(
+        ticket_id, message.from_user.full_name, message.from_user.username, message.from_user.id
+    )
+    sent_list = await _send_to_admins(
+        ticket_id, lambda admin_id: message.bot.send_message(admin_id, header)
+    )
+    if sent_list:
+        await db.set_ticket_header(ticket_id, sent_list[0].chat.id, sent_list[0].message_id)
+    else:
+        logger.error(
+            "Ticket #%s uchun hech qaysi adminga yetkazib bo'lmadi — ADMIN_IDS "
+            "to'g'ri sozlanganini va adminlar botga /start bosganini tekshiring.",
+            ticket_id,
+        )
+
+    await message.answer(
+        "Murojaatingizni yozing (matn, rasm, video yoki ovozli xabar — hammasi "
+        "mumkin). Yuborgach, javobni shu yerda kutib turing.",
+        reply_markup=video_upload_kb(),
+    )
+
+
+@router.message(F.text == BTN_SELL_VIDEO)
+async def start_video_sale(message: Message) -> None:
+    await db.set_active_ticket(message.from_user.id, None)
+    await db.set_awaiting_phone(message.from_user.id, True)
+    await message.answer(VIDEO_INTRO_TEXT, reply_markup=phone_request_kb())
+
+
+@router.message(F.text == BTN_BALANCE)
+async def show_balance(message: Message) -> None:
+    user = await db.get_user(message.from_user.id)
+    balance = user["balance"] if user else 0
+    if balance > 0:
+        await message.answer(
+            f"💰 Sizning balansingiz: <b>{_fmt_price(balance)} so'm</b>\n\n"
+            "Bu — sotib olingan videolaringiz uchun to'langan/to'lanadigan "
+            "summa. Yana video sotsangiz, shu balansga qo'shilib boradi. "
+            "Xohlasangiz hoziroq yechib olishingiz mumkin 👇",
+            reply_markup=balance_withdraw_kb(),
+        )
+    else:
+        await message.answer(
+            "💰 Sizning balansingiz: <b>0 so'm</b>\n\n"
+            "Video sotsangiz va u sotib olinsa, summasi shu yerga "
+            "qo'shilib boradi."
+        )
+
+
+@router.callback_query(F.data == "wd_req")
+async def cb_withdraw_request(callback: CallbackQuery) -> None:
+    user = await db.get_user(callback.from_user.id)
+    balance = user["balance"] if user else 0
+    if balance <= 0:
+        await callback.answer("Balansingiz bo'sh.", show_alert=True)
+        return
+
+    withdrawal_id = await db.create_withdrawal(callback.from_user.id, balance)
+
+    full_name = user["full_name"] if user and user["full_name"] else callback.from_user.full_name
+    uname = f"@{user['username']}" if user and user["username"] else "username yo'q"
+    phone = user["phone"] if user and user["phone"] else "noma'lum"
+    text = (
+        f"💳 <b>Yechib olish so'rovi</b> #{withdrawal_id}\n"
+        f"👤 {full_name} ({uname})\n"
+        f"🆔 <code>{callback.from_user.id}</code>\n"
+        f"📱 <code>{phone}</code>\n"
+        f"💰 Summa: <b>{_fmt_price(balance)} so'm</b>\n\n"
+        "To'lovni amalga oshirgach (karta/naqd orqali), pastdagi tugmani bosing."
+    )
+    await _broadcast_to_admins(
+        lambda admin_id: callback.bot.send_message(
+            admin_id, text, reply_markup=withdrawal_admin_kb(withdrawal_id)
+        )
+    )
+
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except TelegramBadRequest:
+        pass
+    await callback.message.answer(
+        "✅ So'rovingiz qabul qilindi. Admin tez orada siz bilan bog'lanib, "
+        "to'lovni amalga oshiradi."
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("wd:"))
+async def cb_withdraw_confirm(callback: CallbackQuery, bot: Bot) -> None:
+    try:
+        _, wd_id_raw, action = callback.data.split(":")
+        withdrawal_id = int(wd_id_raw)
+    except ValueError:
+        await callback.answer("Xatolik.")
+        return
+
+    if action != "confirm":
+        return  # "paid" harakati faqat handlers/admin.py da ishlanadi
+
+    withdrawal = await db.get_withdrawal(withdrawal_id)
+    if not withdrawal or withdrawal["user_tg_id"] != callback.from_user.id:
+        await callback.answer("Bu so'rov sizga tegishli emas.", show_alert=True)
+        return
+
+    if withdrawal["status"] == "yakunlandi":
+        await callback.answer("Bu so'rov allaqachon yakunlangan.")
+        return
+
+    await db.set_withdrawal_status(withdrawal_id, "yakunlandi")
+    new_balance = await db.subtract_from_balance(callback.from_user.id, withdrawal["amount"])
+
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except TelegramBadRequest:
+        pass
+
+    await callback.message.answer(
+        "✅ Rahmat! To'lov yakunlandi.\n\nKelajakda yana sizdan video kutib qolamiz! 🎥"
+    )
+    await callback.answer("Tasdiqlandi ✅")
+
+    await _broadcast_to_admins(
+        lambda admin_id: bot.send_message(
+            admin_id,
+            f"✅ Foydalanuvchi to'lovni tasdiqladi — yechib olish #{withdrawal_id} "
+            f"yakunlandi ({_fmt_price(withdrawal['amount'])} so'm). Joriy balansi: "
+            f"{_fmt_price(new_balance)} so'm.",
+        )
+    )
+
+
+@router.message(F.contact)
+async def receive_contact(message: Message) -> None:
+    user = await db.get_user(message.from_user.id)
+    if not user or not user["awaiting_phone"]:
+        # "Video sotaman" oqimida emasmiz — bu shunchaki foydalanuvchi ochiq
+        # ticketga (masalan murojaat ichida) yuborgan kontakt bo'lishi mumkin,
+        # shuning uchun uni yo'qotmasdan odatdagidek relay qilamiz.
+        await _relay_to_admin(message)
+        return
+
+    if message.contact.user_id != message.from_user.id:
+        await message.answer(
+            "Iltimos, faqat o'zingizning raqamingizni yuboring.",
+            reply_markup=phone_request_kb(),
+        )
+        return
+
+    phone = message.contact.phone_number
+    await db.set_user_phone(message.from_user.id, phone)
+    await db.set_awaiting_phone(message.from_user.id, False)
+
+    ticket_id = await db.create_ticket(message.from_user.id, kind="video", phone=phone)
+    await db.set_active_ticket(message.from_user.id, ticket_id)
+
+    header = build_video_header(
+        ticket_id,
+        message.from_user.full_name,
+        message.from_user.username,
+        message.from_user.id,
+        phone,
+        "yangi",
+        cfg.min_video_price,
+        cfg.max_video_price,
+    )
+    sent_list = await _send_to_admins(
+        ticket_id,
+        lambda admin_id: message.bot.send_message(
+            admin_id, header, reply_markup=video_status_kb(ticket_id)
+        ),
+    )
+    if sent_list:
+        await db.set_ticket_header(ticket_id, sent_list[0].chat.id, sent_list[0].message_id)
+    else:
+        logger.error(
+            "Ticket #%s uchun hech qaysi adminga yetkazib bo'lmadi — ADMIN_IDS "
+            "to'g'ri sozlanganini va adminlar botga /start bosganini tekshiring.",
+            ticket_id,
+        )
+
+    await message.answer(
+        "Rahmat! Endi video(lar)ni yuboring — <b>tiniq va sifatli</b> bo'lsin. "
+        "Qaerda va qachon suratga olinganini qisqacha va <b>aniq</b> yozib "
+        "qo'ysangiz, ko'rib chiqish tezlashadi.\n\n"
+        "Eslatma: shaxsingiz sir saqlanadi, to'lov esa video kanalga "
+        "chiqqandan keyin amalga oshiriladi.\n\n"
+        "Barcha videolarni yuborib bo'lgach \"✅ Tugatdim\" tugmasini bosing.",
+        reply_markup=video_upload_kb(),
+    )
+
+
+@router.message(F.video)
+async def relay_video(message: Message) -> None:
+    handled = await _relay_to_admin(message)
+    if handled:
+        user = await db.get_user(message.from_user.id)
+        if user and user["active_ticket_id"]:
+            await db.increment_video_count(user["active_ticket_id"])
+
+
+@router.message()
+async def relay_generic(message: Message) -> None:
+    await _relay_to_admin(message)
+
+
+async def _relay_to_admin(message: Message) -> bool:
+    """Foydalanuvchi xabarini faol ticketga (agar bo'lsa) barcha adminlarga forward qiladi.
+
+    True qaytaradi — agar xabar hech bo'lmasa bitta adminga yetkazilgan bo'lsa.
+    """
+    user = await db.get_user(message.from_user.id)
+    if not user:
+        await db.get_or_create_user(
+            message.from_user.id, message.from_user.username, message.from_user.full_name
+        )
+        user = await db.get_user(message.from_user.id)
+
+    if user["awaiting_phone"]:
+        await message.answer(
+            "Davom etish uchun \"📱 Raqamimni yuborish\" tugmasini bosing yoki "
+            "bekor qiling.",
+            reply_markup=phone_request_kb(),
+        )
+        return False
+
+    ticket_id = user["active_ticket_id"]
+    if not ticket_id:
+        await message.answer(
+            "Boshlash uchun quyidagi menyudan birini tanlang 👇", reply_markup=main_menu_kb()
+        )
+        return False
+
+    sent_list = await _send_to_admins(
+        ticket_id,
+        lambda admin_id: message.bot.copy_message(
+            chat_id=admin_id, from_chat_id=message.chat.id, message_id=message.message_id
+        ),
+    )
+    if not sent_list:
+        await message.answer("Xatolik yuz berdi, birozdan so'ng qayta urinib ko'ring.")
+        return False
+    return True
