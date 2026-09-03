@@ -106,9 +106,14 @@ async def _is_subscribed(bot: Bot, user_id: int) -> bool:
     try:
         member = await bot.get_chat_member(chat_id=f"@{cfg.channel_username.lstrip('@')}", user_id=user_id)
         return member.status not in ("left", "kicked")
-    except TelegramBadRequest as exc:
+    except Exception as exc:  # noqa: BLE001 - bu tekshiruv HECH QACHON /start'ni "jim" qoldirmasligi kerak
+        # Masalan bot kanalga admin qilib qo'shilmagan bo'lsa, Telegram turli xil
+        # xato qaytarishi mumkin (nafaqat TelegramBadRequest) — avval faqat
+        # TelegramBadRequest ushlanardi, boshqa xato turi butun /start
+        # funksiyasini "jim-jim" qulatib, foydalanuvchiga hech qanday javob
+        # yubormay qo'yardi. Endi qanday xato bo'lishidan qat'i nazar,
+        # sozlamada muammo bo'lsa foydalanuvchini bloklab qo'ymaymiz.
         logger.warning("Obunani tekshirib bo'lmadi: %s", exc)
-        # Sozlamada xato bo'lsa foydalanuvchini bloklab qo'ymaslik uchun ruxsat beramiz
         return True
 
 
