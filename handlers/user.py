@@ -82,6 +82,9 @@ def _build_sender_caption(message: Message, ticket_id: int, phone: str | None) -
 
 VIDEO_INTRO_TEXT = (
     "🎥 <b>Video sotish</b>\n\n"
+    "❗️<b>Diqqat: hali video yubormang</b> — avval pastdagi "
+    "\"📱 Raqamimni yuborish\" tugmasini bosing. Telefon raqamingizni "
+    "yubormasdan turib yuborilgan video <b>qabul qilinmaydi</b>.\n\n"
     "Hali hech qayerda chiqmagan videongiz bo'lsa, biz undan sotib olishimiz "
     "mumkin.\n\n"
     "⚠️ <b>Muhim eslatmalar:</b>\n"
@@ -96,7 +99,7 @@ VIDEO_INTRO_TEXT = (
     f"💵 Narx holatiga qarab <b>{_fmt_price(cfg.min_video_price)}–"
     f"{_fmt_price(cfg.max_video_price)} so'm</b> oralig'ida belgilanadi "
     f"(eng kami {_fmt_price(cfg.min_video_price)} so'm).\n\n"
-    "Davom etish uchun profilingizdagi telefon raqamni yuboring 👇"
+    "👇 Davom etish uchun pastdagi tugma orqali telefon raqamingizni yuboring:"
 )
 
 
@@ -521,9 +524,15 @@ async def _relay_to_admin(message: Message) -> bool:
         user = await db.get_user(message.from_user.id)
 
     if user["awaiting_phone"]:
+        # Bu yerga "Video sotaman" bosgan, lekin telefon raqamini ulashmasdan
+        # turib video/xabar yuborgan foydalanuvchilar ham tushadi — ular
+        # ko'pincha nima uchun hech narsa bo'lmayotganini tushunmay qolishadi,
+        # shuning uchun xabarni imkon qadar aniq va qat'iy qilib beramiz.
         await message.answer(
-            "Davom etish uchun \"📱 Raqamimni yuborish\" tugmasini bosing yoki "
-            "bekor qiling.",
+            "❌ <b>Bu xabar/video qabul qilinmadi — adminga yuborilmadi.</b>\n\n"
+            "Davom etish uchun avval pastdagi \"📱 Raqamimni yuborish\" "
+            "tugmasini bosing, so'ng video(lar)ingizni <b>qayta yuboring</b>. "
+            "Yoki \"◀️ Bekor qilish\" tugmasini bosing.",
             reply_markup=phone_request_kb(),
         )
         return False
@@ -543,9 +552,10 @@ async def _relay_to_admin(message: Message) -> bool:
     if message.video and not user["phone"]:
         await db.set_awaiting_phone(message.from_user.id, True)
         await message.answer(
-            "🎥 Video qabul qilishdan oldin telefon raqamingizni bilishimiz "
-            "kerak. Iltimos, pastdagi tugma orqali raqamingizni yuboring — "
-            "shundan keyin videongizni qayta yuborasiz.",
+            "❌ <b>Bu video qabul qilinmadi va adminga yuborilmadi.</b>\n\n"
+            "Video yuborishdan oldin telefon raqamingizni bilishimiz kerak. "
+            "Iltimos, pastdagi \"📱 Raqamimni yuborish\" tugmasini bosing — "
+            "shundan keyingina videongizni <b>qayta yuboring</b>.",
             reply_markup=phone_request_kb(),
         )
         return False
